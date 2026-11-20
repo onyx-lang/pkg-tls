@@ -43,6 +43,7 @@ BIO_CTRL_PENDING :: 10
     SSL_free      :: (ssl: Ssl) -> void ---
     SSL_set_bio   :: (ssl: Ssl, rbio: Bio, wbio: Bio) -> void ---
     SSL_ctrl      :: (ssl: Ssl, cmd: i32, larg: i32, parg: rawptr) -> i32 ---
+    SSL_set1_host :: (ssl: Ssl, hostname: rawptr) -> i32 ---
     SSL_connect   :: (ssl: Ssl) -> i32 ---
     SSL_shutdown  :: (ssl: Ssl) -> i32 ---
     SSL_read      :: (ssl: Ssl, buf: rawptr, n: i32) -> i32 ---

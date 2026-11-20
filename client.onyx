@@ -171,6 +171,23 @@ client_vtable := io.Stream_Vtable.{
             err := SSL_get_error(ssl, rc)
             if err == SSL_ERROR_ZERO_RETURN do return .{ Err = .EOF }
             if err == SSL_ERROR_WANT_READ {
+                // Block_On_Read waits for the next TCP segment. Callers that
+                // clear the flag poll with their own deadline, so a read that
+                // needs more ciphertext returns ReadLater and stays open.
+                if flags & .Block_On_Read {
+                    if !fill_in(&sock, rbio) {
+                        alive = false
+                        return .{ Err = .EOF }
+                    }
+                    continue
+                }
+
+                status := sock->poll(0)
+                if status == .Closed {
+                    alive = false
+                    return .{ Err = .EOF }
+                }
+                if status != .Readable do return .{ Err = .ReadLater }
                 if !fill_in(&sock, rbio) {
                     alive = false
                     return .{ Err = .EOF }
@@ -202,9 +219,9 @@ client_vtable := io.Stream_Vtable.{
         if ev == .Write do return .{ Ok = alive }
         if !alive || ~~ssl == null do return .{ Ok = false }
 
-        // Plaintext already decrypted, or ciphertext waiting in the read BIO.
+        // Plaintext already decrypted. An incomplete record in the read BIO
+        // is not ready: wait on the socket instead of spinning.
         if SSL_pending(ssl) > 0 do return .{ Ok = true }
-        if BIO_ctrl(rbio, BIO_CTRL_PENDING, 0, null) > 0 do return .{ Ok = true }
 
         status := sock->poll(timeout)
         if status == .Closed do return .{ Err = .EOF }
@@ -244,7 +261,12 @@ Client.connect :: (host: str, port: u16, ca_pem: str = "") -> Result(Client, io.
         }
     }
 
-    SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, 0, host->to_cstr_on_stack())
+    host_name := host->to_cstr_on_stack()
+    SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, 0, host_name)
+    if ca_pem.count > 0 && SSL_set1_host(ssl, host_name) != 1 {
+        release(&sock, ctx, ssl, rbio, wbio, false)
+        return .{ Err = .CreationFailed }
+    }
     SSL_set_bio(ssl, rbio, wbio)
     BIO_ctrl(rbio, BIO_C_SET_BUF_MEM_EOF_RETURN, -1, null)
     BIO_ctrl(wbio, BIO_C_SET_BUF_MEM_EOF_RETURN, -1, null)

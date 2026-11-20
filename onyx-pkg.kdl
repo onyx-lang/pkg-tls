@@ -3,7 +3,7 @@ package {
     author "Brendan Hansen" 
     url "" 
     description "Transport Layer Security WASM Object bindings from OpenSSL wrapped up in a io.Stream compatible client." 
-    version "0.0.2" 
+    version "0.0.3" 
 }
 
 config {
