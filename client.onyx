@@ -16,6 +16,10 @@ Client :: struct {
     rbio: Bio
     wbio: Bio
     alive: bool
+
+    // Set when a read needs another TCP segment to finish a record. Poll
+    // then waits on the socket instead of treating leftover ciphertext as ready.
+    wait_for_socket: bool
 }
 
 #overload
@@ -187,11 +191,15 @@ client_vtable := io.Stream_Vtable.{
                     alive = false
                     return .{ Err = .EOF }
                 }
-                if status != .Readable do return .{ Err = .ReadLater }
+                if status != .Readable {
+                    wait_for_socket = true
+                    return .{ Err = .ReadLater }
+                }
                 if !fill_in(&sock, rbio) {
                     alive = false
                     return .{ Err = .EOF }
                 }
+                wait_for_socket = false
                 continue
             }
             if err == SSL_ERROR_WANT_WRITE do continue
@@ -219,9 +227,17 @@ client_vtable := io.Stream_Vtable.{
         if ev == .Write do return .{ Ok = alive }
         if !alive || ~~ssl == null do return .{ Ok = false }
 
-        // Plaintext already decrypted. An incomplete record in the read BIO
-        // is not ready: wait on the socket instead of spinning.
-        if SSL_pending(ssl) > 0 do return .{ Ok = true }
+        // Plaintext is ready, or a full record is still sitting in the read
+        // BIO from the handshake. An incomplete record sets wait_for_socket
+        // so the next poll waits for TCP instead of spinning.
+        if SSL_pending(ssl) > 0 {
+            wait_for_socket = false
+            return .{ Ok = true }
+        }
+        if !wait_for_socket && BIO_ctrl(rbio, BIO_CTRL_PENDING, 0, null) > 0 {
+            return .{ Ok = true }
+        }
+        wait_for_socket = false
 
         status := sock->poll(timeout)
         if status == .Closed do return .{ Err = .EOF }
