@@ -1,0 +1,42 @@
+#load "../module"
+
+use core {*}
+use tls {*}
+
+main :: () {
+    printf("connecting\n")
+
+    client: Client
+    switch Client.connect("httpbin.org", 443) {
+        case .Ok as opened { client = opened }
+        case .Err as err {
+            printf("connect failed {}\n", err)
+            openssl_print_errors()
+            return
+        }
+    }
+    defer client->close()
+
+    w := io.Writer.make(&client, 0)
+    defer delete(&w)
+
+    req := "GET / HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n"
+    w->write_str(req)
+    if err := w->consume_error(); err != .None {
+        printf("request failed {}\n", err)
+        openssl_print_errors()
+        return
+    }
+
+    // Reader stops at the blank line that ends the headers. The body is
+    // empty, and reading past it would block until the peer closes TCP.
+    r := io.Reader.make(&client)
+    defer delete(&r)
+
+    while true {
+        line := r->read_line()
+        if line.count == 0 || line[0] == '\r' || line[0] == '\n' do break
+        printf("{}", line)
+    }
+    printf("\n")
+}

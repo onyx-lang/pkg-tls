@@ -1,0 +1,72 @@
+package tls
+
+use core.libc
+
+#package {
+
+Method :: #distinct rawptr
+Ctx    :: #distinct rawptr
+Ssl    :: #distinct rawptr
+Bio    :: #distinct rawptr
+Store  :: #distinct rawptr
+X509   :: #distinct rawptr
+
+SSL_VERIFY_NONE :: 0
+SSL_VERIFY_PEER :: 1
+
+SSL_ERROR_NONE             :: 0
+SSL_ERROR_SSL              :: 1
+SSL_ERROR_WANT_READ        :: 2
+SSL_ERROR_WANT_WRITE       :: 3
+SSL_ERROR_SYSCALL          :: 5
+SSL_ERROR_ZERO_RETURN      :: 6
+
+SSL_CTRL_SET_TLSEXT_HOSTNAME :: 55
+
+// Empty memory BIO reads return a retry instead of EOF. The socket pump
+// fills the BIO, then OpenSSL reads it again.
+BIO_C_SET_BUF_MEM_EOF_RETURN :: 130
+
+// Bytes sitting in a memory BIO, ready to read.
+BIO_CTRL_PENDING :: 10
+
+// wasm32 C `long` is i32. These symbols are defined by libopenssl.a.
+#object "libopenssl.a" {
+    TLS_client_method :: () -> Method ---
+
+    SSL_CTX_new            :: (method: Method) -> Ctx ---
+    SSL_CTX_free           :: (ctx: Ctx) -> void ---
+    SSL_CTX_set_verify     :: (ctx: Ctx, mode: i32, cb: rawptr) -> void ---
+    SSL_CTX_get_cert_store :: (ctx: Ctx) -> Store ---
+
+    SSL_new       :: (ctx: Ctx) -> Ssl ---
+    SSL_free      :: (ssl: Ssl) -> void ---
+    SSL_set_bio   :: (ssl: Ssl, rbio: Bio, wbio: Bio) -> void ---
+    SSL_ctrl      :: (ssl: Ssl, cmd: i32, larg: i32, parg: rawptr) -> i32 ---
+    SSL_connect   :: (ssl: Ssl) -> i32 ---
+    SSL_shutdown  :: (ssl: Ssl) -> i32 ---
+    SSL_read      :: (ssl: Ssl, buf: rawptr, n: i32) -> i32 ---
+    SSL_write     :: (ssl: Ssl, buf: rawptr, n: i32) -> i32 ---
+    SSL_get_error :: (ssl: Ssl, rc: i32) -> i32 ---
+    SSL_pending   :: (ssl: Ssl) -> i32 ---
+
+    BIO_s_mem       :: () -> rawptr ---
+    BIO_new         :: (method: rawptr) -> Bio ---
+    BIO_free        :: (bio: Bio) -> i32 ---
+    BIO_ctrl        :: (bio: Bio, cmd: i32, larg: i32, parg: rawptr) -> i32 ---
+    BIO_read        :: (bio: Bio, buf: rawptr, n: i32) -> i32 ---
+    BIO_write       :: (bio: Bio, buf: rawptr, n: i32) -> i32 ---
+    BIO_new_mem_buf :: (buf: rawptr, len: i32) -> Bio ---
+
+    PEM_read_bio_X509  :: (bio: Bio, out: rawptr, cb: rawptr, u: rawptr) -> X509 ---
+    X509_STORE_add_cert :: (store: Store, cert: X509) -> i32 ---
+    X509_free          :: (cert: X509) -> void ---
+
+    ERR_get_error      :: () -> u32 ---
+    ERR_error_string_n :: (err: u32, buf: rawptr, len: i32) -> void ---
+    ERR_clear_error    :: () -> void ---
+
+    #provide { #namespace libc }
+}
+
+}
