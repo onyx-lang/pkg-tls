@@ -1,6 +1,7 @@
 package tls
 
 use core {*}
+use runtime
 
 #local PUMP_TRIES :: 64
 #local PUMP_CHUNK :: 16384
@@ -20,6 +21,24 @@ Client :: struct {
     // Set when a read needs another TCP segment to finish a record. Poll
     // then waits on the socket instead of treating leftover ciphertext as ready.
     wait_for_socket: bool
+
+    // Zero deadline means blocking socket IO. A set deadline bounds handshake and writes.
+    deadline: time.Instant
+    idle: time.Duration
+    timed_out: bool
+}
+
+Tls_Config :: struct {
+    ca_pem: str
+    insecure: bool
+    server_name: str
+    client_cert_pem: str
+    client_key_pem: str
+}
+
+Connect_Error :: enum {
+    Failed
+    Timeout
 }
 
 #overload
@@ -27,25 +46,81 @@ __dispose_used_local :: macro (c: &Client) {
     #this_package.Client.close(c)
 }
 
+#local
+wait_socket :: (c: &Client, ev: io.PollEvent) -> bool {
+    if cast(i64) c.deadline == 0 && cast(i64) c.idle == 0 do return true
+
+    now := time.Instant.now()
+    wait: time.Duration = 0
+    if cast(i64) c.deadline != 0 {
+        wait = c.deadline - now
+        if wait <= 0 {
+            c.timed_out = true
+            return false
+        }
+    }
+    if cast(i64) c.idle > 0 && (cast(i64) c.deadline == 0 || c.idle < wait) {
+        wait = c.idle
+    }
+    if wait <= 0 {
+        c.timed_out = true
+        return false
+    }
+
+    ms := wait->as_ms()
+    if ms <= 0 do ms = 1
+    if ms > 2000000000 do ms = 2000000000
+
+    fds: [1] runtime.platform.PollDescription
+    fds[0].fd = cast(u64) cast(i32) c.sock.handle
+    fds[0].in_events = ev
+    fds[0].out_events = .None
+    runtime.platform.__poll(fds[0 .. 1], ~~ms)
+
+    got := fds[0].out_events
+    if got == .None {
+        c.timed_out = true
+        return false
+    }
+    if got == .Closed do return false
+    return got == ev
+}
+
 // Ciphertext sits in the write BIO until it is copied onto the TCP socket.
 #local
-flush_out :: (sock: &net.Socket, wbio: Bio) -> bool {
+flush_out :: (c: &Client) -> bool {
     buf: [PUMP_CHUNK] u8
     while true {
-        n := BIO_read(wbio, &buf[0], PUMP_CHUNK)
+        n := BIO_read(c.wbio, &buf[0], PUMP_CHUNK)
         if n <= 0 do return true
-        sock->sendall(buf[0 .. n])
-        if !sock->is_alive() do return false
+
+        off := 0
+        while off < n {
+            if !wait_socket(c, .Write) do return false
+            result := io.Stream.write(&c.sock, buf[off .. n])
+            if result.Ok as wrote {
+                if wrote == 0 do return false
+                off += ~~wrote
+                continue
+            }
+            err := result.Err->unwrap()
+            if err == .NoData || err == .ReadLater || err == .BufferFull do continue
+            return false
+        }
     }
     return true
 }
 
 #local
-fill_in :: (sock: &net.Socket, rbio: Bio) -> bool {
+fill_in :: (c: &Client) -> bool {
+    if !wait_socket(c, .Read) do return false
+
     buf: [PUMP_CHUNK] u8
-    n := sock->recv_into(buf[0 .. PUMP_CHUNK])
-    if n <= 0 do return false
-    return BIO_write(rbio, &buf[0], n) > 0
+    result := io.Stream.read(&c.sock, buf)
+    if result.Err do return false
+    n := result.Ok->unwrap()
+    if n == 0 do return false
+    return BIO_write(c.rbio, &buf[0], ~~n) > 0
 }
 
 #local
@@ -98,7 +173,7 @@ stream_write :: (c: &Client, data: [] u8) -> Result(u32, io.Error) {
         tries += 1
         ptr := cast(rawptr) (cast([&] u8) data.data + off)
         rc := SSL_write(c.ssl, ptr, cast(i32) (data.count - off))
-        if !flush_out(&c.sock, c.wbio) {
+        if !flush_out(c) {
             c.alive = false
             if off > 0 do return .{ Ok = cast(u32) off }
             return .{ Err = .EOF }
@@ -110,7 +185,7 @@ stream_write :: (c: &Client, data: [] u8) -> Result(u32, io.Error) {
 
         err := SSL_get_error(c.ssl, rc)
         if err == SSL_ERROR_WANT_READ {
-            if !fill_in(&c.sock, c.rbio) {
+            if !fill_in(c) {
                 c.alive = false
                 if off > 0 do return .{ Ok = cast(u32) off }
                 return .{ Err = .EOF }
@@ -137,11 +212,16 @@ stream_write_byte :: (c: &Client, byte: u8) -> io.Error {
 }
 
 Client.close :: (c: &Client) {
+    c.deadline = 0
+    c.idle = 0
+    c.timed_out = false
+    if c.alive do c.sock->option(.NonBlocking, false)
+
     if ~~c.ssl != null {
         // Send our close notify. Do not wait for the peer's; some hosts
         // advertise Connection: close and then leave the TCP socket open.
         SSL_shutdown(c.ssl)
-        flush_out(&c.sock, c.wbio)
+        flush_out(c)
         SSL_free(c.ssl)
     }
     if ~~c.ctx != null do SSL_CTX_free(c.ctx)
@@ -166,7 +246,7 @@ client_vtable := io.Stream_Vtable.{
         while tries < PUMP_TRIES {
             tries += 1
             rc := SSL_read(ssl, buffer.data, cast(i32) buffer.count)
-            if !flush_out(&sock, wbio) {
+            if !flush_out(c) {
                 alive = false
                 return .{ Err = .EOF }
             }
@@ -179,7 +259,7 @@ client_vtable := io.Stream_Vtable.{
                 // clear the flag poll with their own deadline, so a read that
                 // needs more ciphertext returns ReadLater and stays open.
                 if flags & .Block_On_Read {
-                    if !fill_in(&sock, rbio) {
+                    if !fill_in(c) {
                         alive = false
                         return .{ Err = .EOF }
                     }
@@ -195,7 +275,7 @@ client_vtable := io.Stream_Vtable.{
                     wait_for_socket = true
                     return .{ Err = .ReadLater }
                 }
-                if !fill_in(&sock, rbio) {
+                if !fill_in(c) {
                     alive = false
                     return .{ Err = .EOF }
                 }
@@ -216,7 +296,7 @@ client_vtable := io.Stream_Vtable.{
 
     flush = (use c: &Client) -> io.Error {
         if !alive do return .EOF
-        if !flush_out(&sock, wbio) {
+        if !flush_out(c) {
             alive = false
             return .EOF
         }
@@ -250,13 +330,34 @@ client_vtable := io.Stream_Vtable.{
     },
 }
 
-Client.connect :: (host: str, port: u16, ca_pem: str = "") -> Result(Client, io.Error) {
-    sock: net.Socket
-    switch net.dial(host, port, .Stream) {
-        case .Ok as opened { sock = opened }
-        case .Err as err   { return .{ Err = err } }
+#local
+install_client_cert :: (ctx: Ctx, cert_pem: str, key_pem: str) -> bool {
+    if cert_pem {
+        bio := BIO_new_mem_buf(cert_pem.data, cast(i32) cert_pem.count)
+        if ~~bio == null do return false
+        cert := PEM_read_bio_X509(bio, null, null, null)
+        BIO_free(bio)
+        if ~~cert == null do return false
+        ok := SSL_CTX_use_certificate(ctx, cert) == 1
+        X509_free(cert)
+        if !ok do return false
     }
+    if key_pem {
+        bio := BIO_new_mem_buf(key_pem.data, cast(i32) key_pem.count)
+        if ~~bio == null do return false
+        key := PEM_read_bio_PrivateKey(bio, null, null, null)
+        BIO_free(bio)
+        if ~~key == null do return false
+        ok := SSL_CTX_use_PrivateKey(ctx, key) == 1
+        EVP_PKEY_free(key)
+        if !ok do return false
+    }
+    return true
+}
 
+// Handshake TLS on an already-connected socket. On failure the socket is closed.
+Client.start :: (sock_in: net.Socket, host: str, cfg: Tls_Config, deadline: time.Instant, idle: time.Duration) -> Result(Client, Connect_Error) {
+    sock := sock_in
     method := TLS_client_method()
     ctx := SSL_CTX_new(method)
     ssl := SSL_new(ctx)
@@ -264,68 +365,101 @@ Client.connect :: (host: str, port: u16, ca_pem: str = "") -> Result(Client, io.
     wbio := BIO_new(BIO_s_mem())
     if ~~ctx == null || ~~ssl == null || ~~rbio == null || ~~wbio == null {
         release(&sock, ctx, ssl, rbio, wbio, false)
-        return .{ Err = .CreationFailed }
+        return .{ Err = .Failed }
     }
 
-    if ca_pem.count == 0 {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, null)
-    } else {
+    verify := !cfg.insecure && cfg.ca_pem.count > 0
+    if verify {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null)
-        if !load_ca_pem(ctx, ca_pem) {
+        if !load_ca_pem(ctx, cfg.ca_pem) {
             release(&sock, ctx, ssl, rbio, wbio, false)
-            return .{ Err = .CreationFailed }
+            return .{ Err = .Failed }
         }
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, null)
     }
 
-    host_name := host->to_cstr_on_stack()
-    SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, 0, host_name)
-    if ca_pem.count > 0 && SSL_set1_host(ssl, host_name) != 1 {
+    if !install_client_cert(ctx, cfg.client_cert_pem, cfg.client_key_pem) {
         release(&sock, ctx, ssl, rbio, wbio, false)
-        return .{ Err = .CreationFailed }
+        return .{ Err = .Failed }
     }
+
+    name := host
+    if cfg.server_name do name = cfg.server_name
+    host_name := name->to_cstr_on_stack()
+    SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, 0, host_name)
+    if verify && SSL_set1_host(ssl, host_name) != 1 {
+        release(&sock, ctx, ssl, rbio, wbio, false)
+        return .{ Err = .Failed }
+    }
+
     SSL_set_bio(ssl, rbio, wbio)
     BIO_ctrl(rbio, BIO_C_SET_BUF_MEM_EOF_RETURN, -1, null)
     BIO_ctrl(wbio, BIO_C_SET_BUF_MEM_EOF_RETURN, -1, null)
 
+    c := Client.{
+        stream = .{
+            vtable = &client_vtable,
+            flags  = .Block_On_Read,
+        },
+        sock     = sock,
+        ctx      = ctx,
+        ssl      = ssl,
+        rbio     = rbio,
+        wbio     = wbio,
+        alive    = true,
+        deadline = deadline,
+        idle     = idle,
+    }
+    if cast(i64) deadline != 0 do c.sock->option(.NonBlocking, true)
+
     tries := 0
     while tries < PUMP_TRIES {
         tries += 1
-        rc := SSL_connect(ssl)
-        if !flush_out(&sock, wbio) {
-            release(&sock, ctx, ssl, rbio, wbio, true)
-            return .{ Err = .ConnectFailed }
+        rc := SSL_connect(c.ssl)
+        if !flush_out(&c) {
+            timed := c.timed_out
+            c->close()
+            if timed do return .{ Err = .Timeout }
+            return .{ Err = .Failed }
         }
         if rc == 1 {
-            return .{ Ok = .{
-                stream = .{
-                    vtable = &client_vtable,
-                    flags  = .Block_On_Read,
-                },
-                sock  = sock,
-                ctx   = ctx,
-                ssl   = ssl,
-                rbio  = rbio,
-                wbio  = wbio,
-                alive = true,
-            } }
+            c.sock->option(.NonBlocking, false)
+            c.deadline = 0
+            c.idle = 0
+            return .{ Ok = c }
         }
 
-        err := SSL_get_error(ssl, rc)
+        err := SSL_get_error(c.ssl, rc)
         if err == SSL_ERROR_WANT_READ {
-            if !fill_in(&sock, rbio) {
-                release(&sock, ctx, ssl, rbio, wbio, true)
-                return .{ Err = .ConnectFailed }
+            if !fill_in(&c) {
+                timed := c.timed_out
+                c->close()
+                if timed do return .{ Err = .Timeout }
+                return .{ Err = .Failed }
             }
             continue
         }
         if err == SSL_ERROR_WANT_WRITE do continue
 
-        release(&sock, ctx, ssl, rbio, wbio, true)
-        return .{ Err = .ConnectFailed }
+        c->close()
+        return .{ Err = .Failed }
     }
 
-    release(&sock, ctx, ssl, rbio, wbio, true)
-    return .{ Err = .ConnectFailed }
+    c->close()
+    return .{ Err = .Failed }
+}
+
+Client.connect :: (host: str, port: u16, ca_pem: str = "") -> Result(Client, io.Error) {
+    sock: net.Socket
+    switch net.dial(host, port, .Stream) {
+        case .Ok as opened { sock = opened }
+        case .Err as err   { return .{ Err = err } }
+    }
+
+    started := Client.start(sock, host, .{ ca_pem = ca_pem }, 0, 0)
+    if started.Err do return .{ Err = .ConnectFailed }
+    return .{ Ok = started.Ok->unwrap() }
 }
 
 // Prints the OpenSSL error queue. The strings point at a stack buffer, so

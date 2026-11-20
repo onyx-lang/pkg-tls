@@ -10,6 +10,7 @@ Ssl    :: #distinct rawptr
 Bio    :: #distinct rawptr
 Store  :: #distinct rawptr
 X509   :: #distinct rawptr
+Pkey   :: #distinct rawptr
 
 SSL_VERIFY_NONE :: 0
 SSL_VERIFY_PEER :: 1
@@ -59,9 +60,14 @@ BIO_CTRL_PENDING :: 10
     BIO_write       :: (bio: Bio, buf: rawptr, n: i32) -> i32 ---
     BIO_new_mem_buf :: (buf: rawptr, len: i32) -> Bio ---
 
-    PEM_read_bio_X509  :: (bio: Bio, out: rawptr, cb: rawptr, u: rawptr) -> X509 ---
-    X509_STORE_add_cert :: (store: Store, cert: X509) -> i32 ---
-    X509_free          :: (cert: X509) -> void ---
+    PEM_read_bio_X509       :: (bio: Bio, out: rawptr, cb: rawptr, u: rawptr) -> X509 ---
+    PEM_read_bio_PrivateKey :: (bio: Bio, out: rawptr, cb: rawptr, u: rawptr) -> Pkey ---
+    X509_STORE_add_cert     :: (store: Store, cert: X509) -> i32 ---
+    X509_free               :: (cert: X509) -> void ---
+    EVP_PKEY_free           :: (pkey: Pkey) -> void ---
+
+    SSL_CTX_use_certificate :: (ctx: Ctx, cert: X509) -> i32 ---
+    SSL_CTX_use_PrivateKey  :: (ctx: Ctx, pkey: Pkey) -> i32 ---
 
     ERR_get_error      :: () -> u32 ---
     ERR_error_string_n :: (err: u32, buf: rawptr, len: i32) -> void ---
